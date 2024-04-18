@@ -237,6 +237,7 @@ async def main():
         max_seconds=5000,
         enable_visualization=True
     )
+    print("this is ciana")
     if evaluation_result is not None:
         print("Solution finished in {} seconds".format(evaluation_result["elapsed_time"]))
     else:
