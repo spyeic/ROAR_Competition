@@ -109,3 +109,4 @@ class RoarCompetitionSolution:
         }
         await self.vehicle.apply_action(control)
         return control
+print("hello")
