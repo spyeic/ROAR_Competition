@@ -6,6 +6,8 @@ Please do not change anything else but fill out the to-do sections.
 from typing import List, Tuple, Dict, Optional
 import roar_py_interface
 import numpy as np
+import math
+from time import sleep
 
 # this fuction takes an angle and normalizes it to be between -pi and pi
 # in other words, -180 and 180 degrees
@@ -51,6 +53,10 @@ class RoarCompetitionSolution:
         self.collision_sensor = collision_sensor
         self.steer_pid_controller = SteeringPIDController()
         self.throttle_pid_controller = ThrottlePIDController()
+        self.f = open('race.txt', 'w')
+        self.target_waypoint_idx = 5
+        self.num_steps = 0
+
 
     
     async def initialize(self) -> None:
@@ -72,6 +78,8 @@ class RoarCompetitionSolution:
         self.prior_speed_error = 0
         self.prior_steer_error = -2
         self.prior_steer_integral = 0
+        self.target_waypoint_idx = 5
+        self.num_steps = 0
 
 
     async def step(
@@ -92,7 +100,9 @@ class RoarCompetitionSolution:
 
         show_location=False
         show_velocity=False
-        show_steer=True
+        show_steer=False
+        write_step=False
+        self.num_steps += 1
 
         # Find the waypoint closest to the vehicle
         self.current_waypoint_idx = filter_waypoints(
@@ -109,8 +119,10 @@ class RoarCompetitionSolution:
             f'{self.maneuverable_waypoints[self.current_waypoint_idx].location[2]:.2f}]')
 
         ## Step 1: find the target line and the angle to the target line
-        target_line = self.get_target_line(vehicle_location, self.current_waypoint_idx, self.maneuverable_waypoints)
+        # print(f'before: {self.target_waypoint_idx}')
+        target_line, self.target_waypoint_idx = self.get_target_line(vehicle_location, self.current_waypoint_idx, self.target_waypoint_idx, self.maneuverable_waypoints)
         target_steer = np.arctan2(target_line[1],target_line[0])
+        # print(f'after: {self.target_waypoint_idx}')
 
         ## Step 2: set the steering control to go to the target line
 
@@ -132,19 +144,23 @@ class RoarCompetitionSolution:
 
         # Step 4: Set the throttle
         speed_error = target_speed - current_speed
-
-        throttle_algo = 3
-
-        if (throttle_algo==1):
-            # Option 1 (original): Simple proportional controller to control the vehicle's speed.
-            # Seems to crash if target_speed is > 20 m/s, so maxes out at 10.1 m/s
-            throttle_control = (speed_kp * speed_error)
-        elif (throttle_algo==3):
-            throttle_control = self.throttle_pid_controller.run(speed_error, vehicle_velocity_norm)
+        throttle_control = self.throttle_pid_controller.run(target_speed, speed_error, vehicle_velocity_norm)
 
         if (show_velocity):
-            # print(f"Velocity =[{vehicle_velocity[0]:.3f},{vehicle_velocity[1]:.3f},{vehicle_velocity[2]:.3f}]={vehicle_velocity_norm:.3F}")
-            print(f"Throttle/Velocity= {throttle_control:.3F}, {vehicle_velocity_norm:.3F}, Waypoint={self.current_waypoint_idx:}")
+            print(f"Throttle/Velocity= {throttle_control:.3F}, {vehicle_velocity_norm:.3F}, Waypoint={self.current_waypoint_idx:}, Target={self.target_waypoint_idx}")
+
+        if (write_step):
+            self.f.write(f'{self.num_steps}, ')
+            self.f.write(f'Location, {vehicle_location[0]:.2f}, {vehicle_location[1]:.2f}, ')
+            self.f.write(f'Velocity, {vehicle_velocity_norm:.2f}, {throttle_control:.3f}, ')
+            self.f.write(f'Waypoint, {self.current_waypoint_idx}, {self.maneuverable_waypoints[self.current_waypoint_idx].location[0]:.2f}, ')
+            self.f.write(f'{self.maneuverable_waypoints[self.current_waypoint_idx].location[1]:.2f}, ')
+            self.f.write(f'Angles, {math.degrees(self.maneuverable_waypoints[self.current_waypoint_idx].roll_pitch_yaw[2]):.1f}, ')
+            self.f.write(f'{math.degrees(vehicle_rotation[2]):.1f}, {self.target_waypoint_idx}, {math.degrees(target_steer):.1F}, ')
+            self.f.write(f'{math.degrees(normalize_rad(target_steer - current_steer)):.1f}, ')
+            self.f.write(f'{steer_error:.2F}, ')
+            self.f.write(f'{throttle_control:.2F} ')
+            self.f.write('\n')
 
 
         control = {
@@ -160,32 +176,127 @@ class RoarCompetitionSolution:
     
     # below are the functions for getting the target line and speed, and the classes for the two PID Controllers
 
-    # this current version simply looks 5 waypoints ahead
-    # it then we calculate the vector to that waypoint. Note the [:2] gets rid of the z coordinate
-    def get_target_line(self, vehicle_location: np.ndarray, current_idx: int, waypoints : List[roar_py_interface.RoarPyWaypoint]):
+    def get_target_line(self, vehicle_location: np.ndarray, current_idx: int, target_idx: int, waypoints : List[roar_py_interface.RoarPyWaypoint]):
 
-        waypoint_to_follow = waypoints[(current_idx + 5) % len(waypoints)]
+        # multiple solutions are coded below.  The variable algo determines which solution to use
+        # debug controls whether messages are displayed as it is working
+        algo = 2
+        debug = False
+
+        if (algo==1):
+            # Basic version that simply looks 5 waypoints ahead
+            # it then we calculate the vector to that waypoint. Note the [:2] gets rid of the z coordinate
+            waypoint_to_follow = waypoints[(current_idx + 5) % len(waypoints)]
+            return (waypoint_to_follow.location - vehicle_location)[:2], (current_idx + 5) % len(waypoints)
+
+        elif (algo==2):
+            # This version looks for a waypoint as far ahead as possible to find a line that does not hit a wall, limited to some maximum
+            # It does this by succeesively testing waypoints further and further out, finding the smallest to the left and right walls,
+            # and ensuring the angle to the waypoint is not hitting any of those walls.  
+            # There were 3 adjustments that had to be made:
+            # 1) you have to start a few waypoints ahead in your testing, otherwise the direction could be completely off
+            # 2) the lookahead waypoint should never go backwards, as that can cause odd steering angles
+            # 3) if we're going through an S-curve, get within 5 waypoints of the where the curve changes before sarting to look ahead again
+            # Future potential improvements
+            # - widen safety to 3 or 4 as steering gets better
+            # - increase max_lookahead to 100 or more
+            # - figure out how to take curves wider, for example as you approach a sharp right turn, start from the left side
+            #   of the track, cut the right wall, and keep going until you are close again to the left side and then straighten out
+
+            # parameters to tweak
+            min_lookahead = 5
+            max_lookahead = 75
+            safety = 2
+
+            # initialize variables
+            min_left_angle = 100
+            min_right_angle = -100
+            waypoint_to_follow = waypoints[target_idx]
+
+            # now see if we can advance our line of sight further
+            start_waypoint = (current_idx+min_lookahead)%len(waypoints)
+            end_waypoint = (current_idx+max_lookahead)%len(waypoints)
+            if (start_waypoint > end_waypoint): 
+                end_waypoint += len(waypoints)
+            look_ahead = start_waypoint
+            if (debug): print(f'analzying from {start_waypoint} to {end_waypoint} out of {len(waypoints)}')
+
+            for i in range(start_waypoint, end_waypoint):
+                if (debug): print(f'iterating on {i}')
+
+                # test the next waypoint by drawing a vector to the waypoint, computing the angle to that waypoint.
+                there = waypoints[(i) % len(waypoints)]
+                vector = (there.location - vehicle_location)[:2]
+                angle_to_waypoint = np.arctan2(vector[1],vector[0])
+
+                # Then calculating the angle to the right and left walls at that waypoint.  Since the track curves,
+                # we want the narrowest path
+                right_wall_angle = angle_to_waypoint - np.arctan2(safety, np.linalg.norm(there.location[:2] - vehicle_location[:2]) )
+                left_wall_angle = angle_to_waypoint + np.arctan2(safety, np.linalg.norm(there.location[:2] - vehicle_location[:2]) )
+                if (right_wall_angle > min_right_angle):
+                    min_right_angle = right_wall_angle
+                if (left_wall_angle < min_left_angle):
+                    min_left_angle = left_wall_angle
+
+                if (debug) and (0 <= current_idx <= 10):
+                    print(f'current={current_idx} ({vehicle_location[0]:.2F},{vehicle_location[1]:.2F}), ',
+                        f'target={target_idx}, ' ,
+                        f'{i} ({there.location[0]:.2F}, {there.location[1]:.2F})), ' ,
+                        f'{math.degrees(angle_to_waypoint):.1F}, ',
+                        f'{math.degrees(left_wall_angle):.1F}, ',
+                        f'{math.degrees(right_wall_angle):.1F}, ',
+                        f'{math.degrees(min_left_angle):.1F}, ',
+                        f'{math.degrees(min_right_angle):.1F}')
+
+                # if angle to the waypoint hits a wall, then stop
+                if (angle_to_waypoint < min_right_angle or angle_to_waypoint > min_left_angle):
+                    break;
+
+                # if direction is changed, then stop.  -1 means right, 1 means left, 0 means neutral
+                if (i==start_waypoint):
+                    previous_angle = angle_to_waypoint
+                    direction = 0
+                else:
+                    if (angle_to_waypoint < previous_angle) and (direction==0):
+                        direction = -1
+                    elif (angle_to_waypoint < previous_angle) and (direction==1):
+                        break
+                    elif (angle_to_waypoint > previous_angle) and (direction==0):
+                        direction = 1
+                    elif (angle_to_waypoint > previous_angle) and (direction==-1):
+                        break
+
+                look_ahead = (i) % len(waypoints)
+                waypoint_to_follow = there
+
+        # adjust so we never go backwards.  Need to adjust for the fact that after 2774 waypoints go back to 0
+        look_ahead_adjusted = (look_ahead + 1000)%len(waypoints)
+        target_idx_adjusted = (target_idx + 1000)%len(waypoints)
+        if (target_idx_adjusted > look_ahead_adjusted):
+            look_ahead = max(look_ahead, target_idx)
+        
         vector_to_waypoint = (waypoint_to_follow.location - vehicle_location)[:2]
-        return vector_to_waypoint
+        return vector_to_waypoint, look_ahead%len(waypoints)
+
 
     # this current version simply sets the speed depending on where you are on the track
     def get_target_speed(self, vehicle_location: np.ndarray, current_idx: int , waypoints : List[roar_py_interface.RoarPyWaypoint]):
 
         # for now, set speed depending on waypoint so we can at least finish the race
-        if (240 < self.current_waypoint_idx < 350):  # straightaway 
-            target_speed = 50
+        if (240 < self.current_waypoint_idx < 400):  # straightaway 
+            target_speed = 25
         elif (450 < self.current_waypoint_idx < 540):  # slight curve
-            target_speed = 20
+            target_speed = 15
         elif (900 < self.current_waypoint_idx < 1200):
-            target_speed = 50
+            target_speed = 35
         elif (1300 < self.current_waypoint_idx < 1500):  # sharp S curve
             target_speed = 20
         elif (1500 < self.current_waypoint_idx < 1800):  # straightaway
             target_speed = 40
         elif (2100 < self.current_waypoint_idx < 2500):
-            target_speed = 40
+            target_speed = 30
         elif (2600 < self.current_waypoint_idx < 2800):   # sharp S curve
-            target_speed = 20
+            target_speed = 15
         else:
             target_speed = 20
 
@@ -221,11 +332,14 @@ class SteeringPIDController():
             steer_kd = 8.0 / (velocity/2)
             steer_ki = 0.002
         else:
+            if (velocity < 10):
+                steer_kp = 1
+                steer_kd = 1
             if (velocity < 25):
                 steer_kp = 0.75
                 steer_kd = 1
             elif (velocity < 50):
-                steer_kp = 0.5
+                steer_kp = 0.0
                 steer_kd = 2
             else:
                 steer_kp = 0.25
@@ -252,12 +366,22 @@ class ThrottlePIDController():
         self.prior_speed_error = 0
         self.prior_speed_integral = 0
 
-    def run(self, speed_error:float, velocity:float) -> float:
+    def run(self, target_speed:float, speed_error:float, velocity:float) -> float:
         speed_kp = 0.4
         speed_kd = 3
-
-        throttle_control = (speed_kp * speed_error) + (speed_kd * (speed_error - self.prior_speed_error))
-
+        algo = 2
+        throttle_control = 0
+        if algo == 1:
+            throttle_control = (speed_kp * speed_error) + (speed_kd * (speed_error - self.prior_speed_error))
+        if algo == 2:
+            target_velocity=target_speed
+            if velocity < target_velocity:
+                throttle_control = 2*(target_velocity-velocity)/target_velocity
+            elif velocity > target_velocity:
+                throttle_control = 2*(target_velocity-velocity)/target_velocity
+            else:
+                throttle_control = 0
+        
         self.prior_speed_error = speed_error
-
+        
         return np.clip(throttle_control, -1.0, 1.0) 
